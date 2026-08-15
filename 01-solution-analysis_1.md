@@ -2,7 +2,7 @@
 
 **Project:** RAGuard — AI customer service assistant for OmniBank (fictional banking client)
 **Author:** Nicolás Romero Niño
-**Status:** Draft v1
+**Status:** Draft v2
 
 ---
 
@@ -57,10 +57,11 @@ hand — it's defined in Terraform alongside the rest of the infrastructure, so 
 reproducible from a clean clone, not an artifact that only exists on my screen.
 
 **5. Stateless design — state outside the process, to enable horizontal scaling**
-The FastAPI services keep no session state in memory. Chat history and session state live in
-PostgreSQL/Redis. Autoscaling is deferred today, but if production ever required horizontal scaling,
-additional replicas could be added without rewriting the application layer — the bottleneck moves to
-Redis/PostgreSQL, not the process itself.
+The FastAPI services keep no session state in memory. Chat history lives in PostgreSQL; session state
+itself is simplified in this MVP, per the project brief's explicit MVP scope, rather than being a full
+session-management layer. Autoscaling is deferred today, but if production ever required horizontal
+scaling, additional replicas could be added without rewriting the application layer — the bottleneck
+moves to the data layer, not the process itself.
 
 ### 2.2 DevOps/DevSecOps practices adopted
 
@@ -153,28 +154,199 @@ standing personal rule: stop, review, study, understand, and only then continue.
 
 ### 3.3 Security & compliance challenges
 
-The security and compliance challenges specific to this project — PII exposure to a third-party LLM
-API, prompt injection via retrieved documents, and the absence of an authentication layer once the
-MVP is deployed — are detailed directly in the risk register below (rows 5–8) rather than repeated
-here in prose, since the register already carries the probability/impact/mitigation reasoning for
-each.
+**5. PII exposure to the external LLM/embeddings provider**
+Every query and every retrieved chunk sent to the LLM or embeddings API is potential exposure of
+customer data to a third party outside this system's boundary — and the same class of risk resurfaces
+on the way back, in the generated response, if inbound redaction missed something or the model
+produces PII-shaped text on its own (risk register rows 5, 6, 9). The mitigation is more than a
+technical safeguard: redacting personal data before it ever leaves the system means the provider
+never processes personal data for this flow, which removes it from the regulatory boundary that would
+otherwise apply. That reframes a code-level control as an architecture decision with a direct legal
+consequence — one of the strongest points this project has to make in an interview. That protection
+also depends on having no way around it: there is a single entry point, with no bypass route — all
+traffic destined for the LLM passes through the guardrail layer by construction, not by convention.
+
+**6. PII persisted at rest in chat history and session state**
+Beyond the outbound path, PostgreSQL and Redis — and the corpus persisted by ChromaDB — hold data that
+can contain personal information if the inbound redaction misses something (risk register row 10).
+This MVP runs Postgres and Redis as containers, and ChromaDB embedded within the application
+process, all on a single free-tier EC2 instance via Docker Compose — none of them are managed
+services, so there is no default encryption at rest to lean on for any of the three. The real control is redaction before persistence, plus enabling EBS volume encryption at the
+infrastructure level (`encrypted = true` in Terraform, using AWS's managed key at no extra cost) — a
+control that actually exists in this architecture, rather than one borrowed from a managed-service
+default that isn't part of the confirmed stack.
+
+**7. Prompt injection via retrieved documents**
+Every document the RAG pipeline retrieves is attacker-reachable surface, even in a self-curated
+corpus — a single compromised or carelessly written document is enough to attempt to redirect the
+model (risk register row 7). The mitigation treats all retrieved content as untrusted data, never as
+instructions, and scans for known injection patterns before that content reaches the LLM.
+
+**8. Absence of authentication once the MVP is deployed**
+Deploying to AWS, even inside the free tier, exposes an endpoint to the public internet. Without an
+authentication layer — deliberately deferred from this MVP — the system depends entirely on
+network-level restrictions (TLS, IP allowlisting, Basic Auth) rather than identity (risk register row
+8). That's an accepted, documented gap, not an oversight.
+
+#### Regulatory compliance mapping
+
+This project doesn't pursue formal GDPR or PCI-DSS certification — that's a governance exercise
+outside the scope of a solo portfolio project (see Section 5, Opportunities for Improvement). What it
+does do is name, in the language of each standard, which existing controls already address that
+standard's requirements, and where the honest answer is "not implemented."
+
+| Requirement | What it means for this design | Status |
+|---|---|---|
+| GDPR — Data minimization | PII is redacted before any data reaches the LLM/embeddings provider; only necessary fields are sent | ✅ Implemented |
+| GDPR — Confidentiality / security of processing | TLS in transit, least-privilege IAM, secrets never in code or git history | ✅ Implemented |
+| GDPR — Third party's role as data processor | Redaction before data leaves the system means the LLM/embeddings provider never processes personal data for this flow — it isn't acting as a data processor under this architecture | ✅ Addressed by design (Challenge #5) |
+| GDPR — Retention & deletion policy | No formal retention or deletion policy is implemented; chat history persists indefinitely in this MVP | ❌ Not implemented |
+| GDPR — Data Protection Impact Assessment (DPIA) | Not performed | ❌ Explicitly out of scope |
+| PCI-DSS — Scope | The system never stores or transmits cardholder data as such; card numbers appearing in user text are redacted before any processing step | ✅ Out of PCI-DSS scope by design |
+| PCI-DSS — Req. 3 (Protect stored cardholder data) | No cardholder data is stored — redaction prevents card numbers from persisting in chat history or session state | ✅ Addressed by redaction + minimization (Challenge #6) |
+| PCI-DSS — Req. 6 (Secure development) | Trivy, pip-audit, and Bandit run as blocking CI gates; the STRIDE threat model is done at design time, before code | ✅ Implemented |
+| PCI-DSS — Req. 10 (Track and monitor access) | `/metrics` and Prometheus/Grafana provide observability, but do not yet constitute a formal audit trail of access to sensitive operations | ⚠️ Partial |
+| PCI-DSS — remaining requirements (1, 2, 4, 5, 7, 8, 9, 11, 12) | Network segmentation, physical security, formal policy documentation, vendor management, and similar controls | ❌ Out of scope — a compliance program, not an engineering deliverable |
+
+### 3.4 Reliability & business-risk challenges
+
+**9. Single point of failure: dependency on third-party APIs**
+Both the LLM and the embeddings provider are external services outside this project's control (risk
+register row 11). If either becomes unavailable, the system's behavior needs to be a deliberate
+choice, not an accident: this project fails hard and honestly — returning a clear "service temporarily
+unavailable" response — rather than attempting a degraded answer assembled without generation. In a
+banking context, an honest failure is safer than a response that looks complete but wasn't properly
+grounded.
+
+**10. Variable, usage-driven cost**
+Every query costs money, through both the LLM/embeddings API and AWS compute (risk register row 12).
+The rate limiting already implemented for availability doubles as a cost control, capping not just
+concurrent load but exposure to runaway spend. AWS budget alerts, provisioned through Terraform, are
+the second half of this control.
+
+**11. Ungrounded or incorrect answers**
+This is the central business risk of a banking assistant: a wrong answer about a rate or a policy is
+not just a bad user experience, it's potential financial and regulatory harm (risk register row 13).
+Grounding every answer in a cited source, and refusing to answer when retrieval returns nothing
+relevant, mitigates hallucination from *nothing* — but doesn't protect against a confident,
+correctly-grounded answer built on a document that's simply out of date. A minimal "last reviewed"
+field per document in the corpus is the cheap first line of defense against that; full document
+versioning and governance is deferred.
 
 ---
 
 ## 4. Risk Register
 
-| # | Risk | Category | Probability | Impact | Mitigation | Decision (Implement/Defer) + Rationale |
-|---|---|---|---|---|---|---|
-| 1 | Resource contention under traffic spikes | Technical | Medium-High — depends on traffic; without controls, a moderate spike can degrade or take down the service | High — downtime, cost increase, poor UX, possible abuse | Rate limiting, strict timeouts, concurrency limits, embedding/response caching with Redis (already part of the confirmed stack). Message broker/queue: explicitly deferred (the earlier decision is not reopened). Deferred: advanced autoscaling, distributed queue handling, complex circuit breakers | **Implement** rate limiting, timeouts, concurrency limits, and Redis caching in the MVP. *Why:* these are cheap controls that protect availability and cost without extra infrastructure; the broker/queue is deferred because it doesn't solve the underlying resource constraint — it adds another consumer competing for the same limited RAM. |
-| 2 | Missed latency target (2.5s) under load | Technical | Medium — without measurement, likely; concurrent load can exceed it easily | High — UX degradation, user drop-off, failure to meet an explicit requirement | Measure latency per stage (retrieval, embedding, LLM call), set a time budget, cache frequent responses via Redis (same mechanism as row 1), cap active concurrent load. Model swap: **not an MVP commitment** — only evaluated as a data-driven contingency if the latency measurements show the LLM call is the actual bottleneck. Deferred: deep model optimization, fine-tuning, specialized infrastructure | **Implement** latency measurement, a time budget, Redis caching, and a concurrency cap in the MVP; **defer** advanced optimizations. *Why:* without metrics there's no way to know if the risk is real; measuring from day one lets the target be evaluated with data instead of assumption, and keeps a faster-model swap as a reasoned fallback rather than a premature commitment. |
-| 3 | Design blind spots ("unknown unknowns") | Organizational | Medium-High — inherent to working without external review; can surface as early wrong decisions | Medium-High — rework, fragile architecture, dead ends | Document decisions and assumptions; review architectural decisions with the AI assistant as a second set of eyes at defined checkpoints (e.g., end of each MVP module). *Note: an AI assistant is a partial mitigation, not a substitute for independent human review — it can share blind spots similar to my own.* Deferred: external consulting, formal design audits | **Implement** decision documentation and AI-assisted review at milestones; **defer** formal audits. *Why:* it's a cheap, verifiable control, and documenting decisions makes it possible to correct course without rebuilding from scratch — while being explicit that this does not fully replace independent human review. |
-| 4 | Project stagnation from lack of external pressure | Organizational | Medium-High — a typical risk in solo personal projects | High — MVP never finished, loss of focus, abandonment | Weekly commit checkpoint, tied to the same weekly checkpoint used to review the job search; two consecutive checkpoints with no measurable progress = risk materialized, plan gets adjusted. No public demos or mentor commitment (not applicable here). Defer: not applicable — this is a way of working, not a feature | **Implement** the weekly commit checkpoint as the control mechanism. *Why:* this is the decision already made; anchoring it to the job-search review creates real external pressure and defines a clear, checkable threshold for "risk materialized." |
-| 5 | PII leakage to the external embeddings/LLM API | Security/Compliance | Medium — without any control it would be High; with basic redaction, residual exposure remains | High — personal-data breach, legal/reputational exposure | PII redaction before the embedding step, data minimization, logs without payloads, sending only the fields that are necessary. Deferred: advanced DLP, tokenization/pseudonymization, LLM-based review | **Implement** redaction and minimization in the MVP. *Why:* it's a cheap control that closes off the main exposure path; raw PII should never be sent to a third party. |
-| 6 | False negatives in PII redaction | Security/Compliance | Medium-High — pattern/regex detectors don't have full recall, especially for names, addresses, and local formats | High — same category of leak, but with a false sense of having it covered | Assume detection will fail: minimize data at the source (truncate chat history sent to the model, forward only the relevant chunk instead of the full document, never persist raw text in logs), use allow/deny lists, manual sampling review during the weekly checkpoint to spot residual PII. Deferred: NER/ML-based detection, an automated reviewer, a second redaction pass by an LLM | **Implement** "imperfect detection + minimization" in the MVP; **defer** advanced detection. *Why:* a reviewer will question blind trust in regex; it's more honest to assume the detector fails and limit what data can reach it than to promise perfect detection. The specific minimizations (truncated history, chunk-only, no raw logs) are achievable without breaking the RAG flow. |
-| 7 | Prompt injection via retrieved documents | Security/Compliance | Medium — depends on whether third-party documents are indexed or only the bank's own; Low if only the bank's own | High — the LLM could follow embedded instructions, manipulate answers, or attempt to exfiltrate context | Treat every retrieved document as untrusted; explicit system prompt; delimit context and instruct the model to extract/cite only; give the LLM no tools or actions; scan retrieved content for known injection patterns before it reaches the LLM. Deferred: advanced content filters, an LLM-based reviewer, full sandboxing | **Implement** system instructions, context delimiting, and basic injection-pattern detection in the MVP; **defer** advanced defenses. *Why:* pattern detection is low-cost and was already part of the plan; it adds a layer of defense without extra infrastructure. |
-| 8 | No authentication/authorization or secrets handling once the MVP is exposed | Security/Compliance | Medium-High — the AWS deploy is a confirmed part of D3/D4, so this risk is real, not hypothetical, even for a personal project | High — unauthorized access, endpoint abuse, secret exposure, data theft | Bind restrictions / IP allowlist / Basic Auth on the AWS deployment (definitive, not conditional), always behind mandatory TLS termination at the reverse proxy — Basic Auth without HTTPS is not a real access control. Secrets via environment variables, following the existing rule: "no secrets in code or git history — `.env.example` only." Terraform state is never committed and, if remote state is used, stored in an encrypted backend. The IAM role used by the pipeline/deployment is scoped only to the resources this project touches. GitHub Actions secrets go through its native secrets mechanism and are never echoed in CI logs; `terraform plan` output is reviewed before `apply`. Deferred: full auth/authz layer, OIDC, a secrets vault, secret rotation | **Implement** minimal access restriction (IP allowlist/Basic Auth) behind mandatory TLS, `.env`-based secrets handling, an ignored/encrypted Terraform state, and least-privilege IAM on the AWS deployment. *Why:* the AWS deploy is a confirmed part of the MVP (D3/D4), so the absence of auth isn't acceptable, and access control without TLS or a scoped IAM role is decorative rather than real; this set of controls is minimal but complete, without building a full enterprise auth layer prematurely. |
-| 9 | PII leakage or hallucination in generated output | Security/Compliance | Medium — inbound redaction can fail, or the model can generate PII-shaped text even when the retrieved context didn't contain it | High — same class of breach as inbound leakage, caught later, closer to the user | Scan the generated response before returning it, using the same detector as the inbound redaction; verify the response is grounded in the retrieved chunks; refuse rather than answer when retrieval is empty or insufficient; adversarial tests for the output guardrail | **Implement** output validation in the MVP. *Why:* this is literally guardrail #3 from the project brief, already committed in scope but previously untracked in this register. |
-| 10 | PII persisted at rest in chat history / session state | Security/Compliance | Medium — inbound redaction can fail, and structured session fields may legitimately include sensitive identifiers | High — same class of breach as inbound leakage, but sitting in the data store rather than in transit | Redact before persisting, using the same detector as inbound redaction, before chat history or session state is written to PostgreSQL/Redis. Beyond that, this MVP relies on the default protections of managed Postgres/Redis rather than building custom encryption-at-rest, backup encryption, or a formal retention policy | **Implement** pre-persistence redaction only; **defer** the full at-rest lifecycle (custom encryption at rest, encrypted backups, formal retention/deletion policy) — tracked in Opportunities for Improvement. *Why:* redaction before writing is cheap and closes the main gap; a full data-lifecycle program is disproportionate to a solo portfolio MVP. |
+### Summary
+
+| # | Risk | Category | Decision |
+|---|---|---|---|
+| 1 | Resource contention under traffic spikes | Technical | Implement |
+| 2 | Missed latency target (2.5s) under load | Technical | Implement — aspirational target, accepted risk under load |
+| 3 | Design blind spots ("unknown unknowns") | Organizational | Implement — partial, AI review is not a human-review substitute |
+| 4 | Project stagnation from lack of external pressure | Organizational | Implement |
+| 5 | PII leakage to the external embeddings/LLM API | Security/Compliance | Implement |
+| 6 | False negatives in PII redaction | Security/Compliance | Implement — partial, assumes the detector fails |
+| 7 | Prompt injection via retrieved documents | Security/Compliance | Implement |
+| 8 | No authentication/secrets handling once exposed | Security/Compliance | Implement — minimal |
+| 9 | PII leakage or hallucination in generated output | Security/Compliance | Implement |
+| 10 | PII persisted at rest in chat history / session state | Security/Compliance | Implement — minimal |
+| 11 | Third-party API unavailable — single point of failure | Technical | Implement — hard fail |
+| 12 | Variable, usage-driven cost | Technical | Implement |
+| 13 | Ungrounded or incorrect answers | Business/Product | Implement — partial |
+
+### Detail
+
+#### Risk 1 — Resource contention under traffic spikes
+- **Category:** Technical
+- **Probability:** Medium-High — depends on traffic; without controls, a moderate spike can degrade or take down the service
+- **Impact:** High — downtime, cost increase, poor UX, possible abuse
+- **Mitigation:** Rate limiting, strict timeouts, concurrency limits, embedding/response caching with Redis (already part of the confirmed stack). Message broker/queue: explicitly deferred (the earlier decision is not reopened). Deferred: advanced autoscaling, distributed queue handling, complex circuit breakers.
+- **Decision:** **Implement** rate limiting, timeouts, concurrency limits, and Redis caching in the MVP. *Why:* these are cheap controls that protect availability and cost without extra infrastructure; the broker/queue is deferred because it doesn't solve the underlying resource constraint — it adds another consumer competing for the same limited RAM.
+
+#### Risk 2 — Missed latency target (2.5s) under load
+- **Category:** Technical
+- **Probability:** Medium — without measurement, likely; concurrent load can exceed it easily
+- **Impact:** High — UX degradation, user drop-off, failure to meet an explicit requirement
+- **Mitigation:** Measure latency per stage (retrieval, embedding, LLM call, and the output-validation scan added in Risk 9), set a time budget, cache frequent responses via Redis (same mechanism as Risk 1), cap active concurrent load. Model swap: **not an MVP commitment** — only evaluated as a data-driven contingency if the latency measurements show the LLM call is the actual bottleneck. Deferred: deep model optimization, fine-tuning, specialized infrastructure.
+- **Decision:** **Implement** latency measurement, a time budget, Redis caching, and a concurrency cap in the MVP; **defer** advanced optimizations. *Why:* without metrics there's no way to know if the risk is real; measuring from day one lets the target be evaluated with data instead of assumption, and keeps a faster-model swap as a reasoned fallback rather than a premature commitment.
+
+#### Risk 3 — Design blind spots ("unknown unknowns")
+- **Category:** Organizational
+- **Probability:** Medium-High — inherent to working without external review; can surface as early wrong decisions
+- **Impact:** Medium-High — rework, fragile architecture, dead ends
+- **Mitigation:** Document decisions and assumptions; review architectural decisions with the AI assistant as a second set of eyes at defined checkpoints (e.g., end of each MVP module). *Note: an AI assistant is a partial mitigation, not a substitute for independent human review — it can share blind spots similar to my own.* Deferred: external consulting, formal design audits.
+- **Decision:** **Implement** decision documentation and AI-assisted review at milestones; **defer** formal audits. *Why:* it's a cheap, verifiable control, and documenting decisions makes it possible to correct course without rebuilding from scratch — while being explicit that this does not fully replace independent human review.
+
+#### Risk 4 — Project stagnation from lack of external pressure
+- **Category:** Organizational
+- **Probability:** Medium-High — a typical risk in solo personal projects
+- **Impact:** High — MVP never finished, loss of focus, abandonment
+- **Mitigation:** Weekly commit checkpoint, tied to the same weekly checkpoint used to review the job search; two consecutive checkpoints with no measurable progress = risk materialized, plan gets adjusted. No public demos or mentor commitment (not applicable here). Defer: not applicable — this is a way of working, not a feature.
+- **Decision:** **Implement** the weekly commit checkpoint as the control mechanism. *Why:* this is the decision already made; anchoring it to the job-search review creates real external pressure and defines a clear, checkable threshold for "risk materialized."
+
+#### Risk 5 — PII leakage to the external embeddings/LLM API
+- **Category:** Security/Compliance
+- **Probability:** Medium — without any control it would be High; with basic redaction, residual exposure remains
+- **Impact:** High — personal-data breach, legal/reputational exposure
+- **Mitigation:** PII redaction before the embedding step, data minimization, logs without payloads, sending only the fields that are necessary. Deferred: advanced DLP, tokenization/pseudonymization, LLM-based review.
+- **Decision:** **Implement** redaction and minimization in the MVP. *Why:* it's a cheap control that closes off the main exposure path; raw PII should never be sent to a third party.
+
+#### Risk 6 — False negatives in PII redaction
+- **Category:** Security/Compliance
+- **Probability:** Medium-High — pattern/regex detectors don't have full recall, especially for names, addresses, and local formats
+- **Impact:** High — same category of leak, but with a false sense of having it covered
+- **Mitigation:** Assume detection will fail: minimize data at the source (truncate chat history sent to the model, forward only the relevant chunk instead of the full document, never persist raw text in logs), use allow/deny lists, manual sampling review during the weekly checkpoint to spot residual PII. Deferred: NER/ML-based detection, an automated reviewer, a second redaction pass by an LLM.
+- **Decision:** **Implement** "imperfect detection + minimization" in the MVP; **defer** advanced detection. *Why:* a reviewer will question blind trust in regex; it's more honest to assume the detector fails and limit what data can reach it than to promise perfect detection. The specific minimizations (truncated history, chunk-only, no raw logs) are achievable without breaking the RAG flow.
+
+#### Risk 7 — Prompt injection via retrieved documents
+- **Category:** Security/Compliance
+- **Probability:** Medium — depends on whether third-party documents are indexed or only the bank's own; Low if only the bank's own
+- **Impact:** High — the LLM could follow embedded instructions, manipulate answers, or attempt to exfiltrate context
+- **Mitigation:** Treat every retrieved document as untrusted; explicit system prompt; delimit context and instruct the model to extract/cite only; give the LLM no tools or actions; scan retrieved content for known injection patterns before it reaches the LLM. Deferred: advanced content filters, an LLM-based reviewer, full sandboxing.
+- **Decision:** **Implement** system instructions, context delimiting, and basic injection-pattern detection in the MVP; **defer** advanced defenses. *Why:* pattern detection is low-cost and was already part of the plan; it adds a layer of defense without extra infrastructure.
+
+#### Risk 8 — No authentication/authorization or secrets handling once the MVP is exposed
+- **Category:** Security/Compliance
+- **Probability:** Medium-High — the AWS deploy is a confirmed part of D3/D4, so this risk is real, not hypothetical, even for a personal project
+- **Impact:** High — unauthorized access, endpoint abuse, secret exposure, data theft
+- **Mitigation:** Bind restrictions / IP allowlist / Basic Auth on the AWS deployment (definitive, not conditional), always behind mandatory TLS termination at the reverse proxy — Basic Auth without HTTPS is not a real access control. Secrets via environment variables, following the existing rule: "no secrets in code or git history — `.env.example` only." Terraform state is never committed and, if remote state is used, stored in an encrypted backend. The IAM role used by the pipeline/deployment is scoped only to the resources this project touches. GitHub Actions secrets go through its native secrets mechanism and are never echoed in CI logs; `terraform plan` output is reviewed before `apply`. Deferred: full auth/authz layer, OIDC, a secrets vault, secret rotation.
+- **Decision:** **Implement** minimal access restriction (IP allowlist/Basic Auth) behind mandatory TLS, `.env`-based secrets handling, an ignored/encrypted Terraform state, and least-privilege IAM on the AWS deployment. *Why:* the AWS deploy is a confirmed part of the MVP (D3/D4), so the absence of auth isn't acceptable, and access control without TLS or a scoped IAM role is decorative rather than real; this set of controls is minimal but complete, without building a full enterprise auth layer prematurely.
+
+#### Risk 9 — PII leakage or hallucination in generated output
+- **Category:** Security/Compliance
+- **Probability:** Medium — inbound redaction can fail, or the model can generate PII-shaped text even when the retrieved context didn't contain it
+- **Impact:** High — same class of breach as inbound leakage, caught later, closer to the user
+- **Mitigation:** Scan the generated response before returning it, using the same detector as the inbound redaction; verify the response is grounded in the retrieved chunks; refuse rather than answer when retrieval is empty or insufficient; adversarial tests for the output guardrail.
+- **Decision:** **Implement** output validation in the MVP. *Why:* this is literally guardrail #3 from the project brief, already committed in scope but previously untracked in this register.
+
+#### Risk 10 — PII persisted at rest in chat history / session state
+- **Category:** Security/Compliance
+- **Probability:** Medium — inbound redaction can fail, and structured session fields may legitimately include sensitive identifiers
+- **Impact:** High — same class of breach as inbound leakage, but sitting in the data store rather than in transit
+- **Mitigation:** Redact before persisting, using the same detector as inbound redaction, before chat history or session state is written to PostgreSQL/Redis. Postgres and Redis run as containers, and ChromaDB embedded within the application process, all on a single free-tier EC2 instance — there is no managed service here, so there is no default encryption at rest for any of them. The actual control is enabling EBS volume encryption in Terraform (`encrypted = true`, AWS-managed key, no additional cost), applied to the instance's storage rather than assumed per-service.
+- **Decision:** **Implement** pre-persistence redaction plus EBS volume encryption via Terraform; **defer** the full at-rest lifecycle (encrypted backups, a formal retention/deletion policy) — tracked in Opportunities for Improvement. *Why:* redaction before writing is cheap, and EBS encryption is a one-line Terraform parameter that matches this project's real infrastructure — unlike relying on managed-service defaults this architecture doesn't use; a full data-lifecycle program is disproportionate to a solo portfolio MVP.
+
+#### Risk 11 — Third-party API unavailable — single point of failure
+- **Category:** Technical
+- **Probability:** Medium — external SaaS outages happen periodically
+- **Impact:** High — the entire response pipeline depends on this call; no fallback provider is configured
+- **Mitigation:** Detect provider failure (timeout/error) and return an explicit, honest "service temporarily unavailable" response, rather than attempting a degraded answer assembled without generation.
+- **Decision:** **Implement** hard-fail behavior with a clear error response; **defer** multi-provider fallback / automatic failover. *Why:* in a banking context, an honest failure is safer than a partial or ungrounded response that looks complete but wasn't properly generated — the user knows to retry or use another channel, rather than receiving something that looks like an answer but isn't.
+
+#### Risk 12 — Variable, usage-driven cost
+- **Category:** Technical
+- **Probability:** Medium — cost scales with traffic, including abusive or bot traffic
+- **Impact:** Medium — budget overrun; not a security breach, but a real operational risk
+- **Mitigation:** Rate limiting (Risk 1) doubles as a cost control, not just an availability control — it caps exposure to runaway spend, not only concurrent load. AWS budget alerts, configured via Terraform, are the second half of this control.
+- **Decision:** **Implement** rate limiting as a dual-purpose control plus Terraform-provisioned budget alerts. *Why:* the mechanism already exists for availability; declaring its cost-control role and adding budget alerts closes the gap cheaply, without new infrastructure.
+
+#### Risk 13 — Ungrounded or incorrect answers
+- **Category:** Business/Product
+- **Probability:** Medium — grounding prevents hallucination from nothing, but doesn't prevent a correct-sounding answer built on an outdated document
+- **Impact:** High — a wrong rate or policy is financial and regulatory harm, not just a bad UX
+- **Mitigation:** Ground every answer in a cited retrieved source; refuse to answer when retrieval returns nothing sufficiently relevant (shared mechanism with Risk 9's output validation); track a minimal "last reviewed" date per document in the corpus so staleness is visible, even without a full versioning system. The specific similarity threshold that defines "sufficiently relevant" is not fixed here — it's a concrete decision that belongs to D2 architecture, and needs to be set deliberately before implementation, not discovered mid-build.
+- **Decision:** **Implement** grounding, refusal-on-empty-retrieval, and a minimal "last reviewed" field per document; **defer** a full document versioning/governance workflow. *Why:* this is the central business risk of a banking assistant — a technically correct RAG pipeline can still confidently cite a stale document; a single metadata field is a cheap first line of defense against that, without building a full document-management system.
 
 ### 4.1 Scope Notes
 
@@ -204,10 +376,12 @@ item becomes relevant either in a second iteration or if the project's scope cha
 - Advanced DLP, tokenization/pseudonymization for PII, ML/NER-based PII detection beyond pattern matching
 - An LLM-based reviewer as an additional output-validation layer; full sandboxing of retrieved content
 - Deep model optimization, fine-tuning, or an alternative model — only if latency measurements show the LLM call is the actual bottleneck
-- Full PII-at-rest lifecycle: custom encryption at rest, encrypted backups, a formal data retention/deletion policy
-- Formal compliance mapping: a DPIA, data-subject rights (access/rectification/erasure), audit logging, a full PCI-DSS/GDPR control map
+- Full PII-at-rest lifecycle beyond EBS-level volume encryption: encrypted backups, a formal data retention/deletion policy, and application-level encryption for particularly sensitive fields if ever needed
+- Formal compliance mapping: a DPIA, data-subject rights (access/rectification/erasure), audit logging, a full PCI-DSS/GDPR control map beyond the requirements already addressed in Section 3.3
 - Document/corpus ingestion integrity controls (source allowlisting, validation, adversarial testing) — relevant only if external or automated ingestion is ever added
 - Third-party LLM/embeddings provider due diligence (data residency, training-data usage policy, contractual terms) — to be addressed as part of the D2 ADR on provider selection
+- Multi-provider fallback / automatic failover for the LLM and embeddings APIs, instead of the MVP's deliberate hard-fail-and-be-honest behavior on outage
+- Full document versioning and governance workflow for the corpus, beyond the MVP's minimal "last reviewed" field per document
 
 ---
 
