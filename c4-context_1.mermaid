@@ -1,0 +1,16 @@
+C4Context
+title System Context diagram — RAGuard (MVP)
+
+Person(customer, "OmniBank Customer", "A retail or corporate bank customer with a question about products, policies, or fees. Web only in this MVP.")
+
+System(raguard, "RAGuard", "Answers customer questions in natural language via a RAG pipeline, with PII redaction, prompt-injection defense, output validation, and rate limiting.")
+
+System_Ext(legacyCore, "OmniBank Legacy Core", "The bank's existing on-premise banking platform. Owned and operated independently of RAGuard. Simulated via a mock service in this MVP.")
+
+System_Ext(llmProvider, "LLM / Embeddings Provider", "External API (e.g. Cohere) used for generating embeddings and chat completions.")
+
+Rel(customer, raguard, "Asks questions", "HTTPS")
+Rel(raguard, legacyCore, "Reads structured product and rate data, through the legacy abstraction layer", "REST (mocked in MVP)")
+Rel(raguard, llmProvider, "Sends redacted queries and retrieved context; receives embeddings and generated answers", "HTTPS / API")
+
+UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")

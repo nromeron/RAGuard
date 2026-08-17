@@ -1,0 +1,49 @@
+C4Component
+title Component diagram — RAGuard App (MVP)
+
+Container_Ext(nginx, "Nginx", "Docker container", "Reverse proxy, TLS termination, IP allowlist.")
+Container_Ext(legacyMock, "Legacy Mock Service", "Docker container", "Simulates the OmniBank Legacy Core; exposes structured product, rate, and policy data.")
+
+Container_Boundary(app, "RAGuard App") {
+  Component(rateLimit, "Rate Limiting", "Middleware", "Cross-cutting middleware, applied to every request before any guardrail logic runs. Sits outside the orchestrator by design — it's an admission-control concern, not a step in the content pipeline.")
+  Component(orchestrator, "Pipeline Orchestrator", "Component", "Owns the guardrail pipeline's sequence and every abort decision: cache hit (early return), insufficient retrieval, LLM/embeddings provider failure (Risk 11's hard-fail-and-be-honest behavior), and validation failure. Quota exceeded is handled upstream by Rate Limiting. The only component that knows the order — every component below is stateless and single-responsibility: none of them know their neighbors, none persist data, and where one needs external I/O, it talks only to the one system it owns.")
+  Component(piiRedact, "PII Redaction", "Component", "Redacts PII from the user's raw query. Stateless, no external calls: input is the raw query, output is the redacted query.")
+  Component(retrieval, "Retrieval Engine", "Component", "Computes the query's embedding via the external provider, then searches ChromaDB for relevant chunks. Stateless, single-responsibility: input is the redacted query, output is chunks + similarity scores. Its only external network call is to the embeddings provider — ChromaDB itself is in-process, not a network call.")
+  Component(sufficiency, "Retrieval Sufficiency Check", "Component", "Evaluates whether retrieved chunks are empty or below the similarity threshold. Stateless, no external calls: input is chunks + scores, output is a pass/reject decision — the orchestrator acts on that decision.")
+  Component(legacyNecessity, "Legacy Data Necessity Check", "Component", "Checks the redacted query against a deliberately broad keyword bank (rates, fees, product names, tiers, and their common synonyms) to decide whether structured legacy data is needed to answer this request. Stateless, no external calls: input is the redacted query, output is a yes/no decision — the orchestrator only calls Legacy Data Client when this returns yes, avoiding an unconditional network call on every request.")
+  Component(legacyClient, "Legacy Data Client", "Component", "Calls the Legacy Mock Service for structured product/rate data — only when Legacy Data Necessity Check says it's needed — and validates the response against an expected schema: typed fields only, no unexpected free text. The type-based equivalent of the pattern-based scan applied to document chunks. Its only external call is to the Legacy Mock Service.")
+  Component(injectionDef, "Prompt Injection Defense", "Component", "Delimits and scans retrieved chunks for known injection patterns. Stateless, no external calls: input is raw chunks, output is sanitized, delimited context.")
+  Component(generation, "Generation Engine", "Component", "Assembles the final prompt from sanitized document context and validated structured data — both received as inputs, not fetched itself — with a hardened system prompt against direct instruction override, and calls the external LLM. Its only external call is to the LLM provider.")
+  Component(outputVal, "Output Validation", "Component", "Scans the generated response for PII and verifies it's grounded — checked against both the retrieved document chunks and any structured legacy data used to build the prompt, not documents alone. Stateless, no external calls: returns a validated/redacted result or a rejection — does not persist or cache; that belongs to the orchestrator.")
+  ComponentDb(chroma, "ChromaDB", "Embedded vector store", "Stores document chunks and their embeddings.")
+  Component(ingestion, "Ingestion Pipeline", "Offline script/CLI", "Reads corpus documents, chunks them hierarchically (by logical section, with a fixed-size-plus-overlap fallback for oversized sections — see D2 §3), computes embeddings via the external provider, writes to ChromaDB, and sets the 'last reviewed' field per document (Risk 13). Runs once, manually, before the API serves traffic — not part of the request path.")
+}
+
+ContainerDb_Ext(redis, "Redis", "Docker container", "Rate-limit counters; cache for frequent, fully-validated responses (ephemeral), keyed by redacted query. Not the vector store.")
+ContainerDb_Ext(postgres, "PostgreSQL", "Docker container", "Session state (simplified) and chat history. Not structured product/rate data — that lives behind the legacy abstraction layer only, never duplicated here.")
+System_Ext(llmProvider, "LLM / Embeddings Provider", "External API")
+
+Rel(nginx, rateLimit, "Forwards request", "HTTP")
+Rel(rateLimit, redis, "Checks / increments request count", "sync")
+Rel(rateLimit, orchestrator, "Passes request if within quota", "in-process")
+
+Rel(orchestrator, piiRedact, "1. Redact PII from raw query", "in-process")
+Rel(orchestrator, redis, "2. Look up cached response by redacted query", "sync")
+Rel(orchestrator, retrieval, "3. Retrieve chunks — on cache miss", "in-process")
+Rel(retrieval, llmProvider, "Computes query embedding", "HTTPS/API, sync")
+Rel(retrieval, chroma, "Searches for chunks using the query embedding", "in-process")
+Rel(orchestrator, sufficiency, "4. Check retrieval sufficiency", "in-process")
+Rel(orchestrator, legacyNecessity, "5. Check whether structured legacy data is needed", "in-process")
+Rel(orchestrator, legacyClient, "6. Fetch structured product/rate data — only if step 5 says yes", "in-process")
+Rel(legacyClient, legacyMock, "Fetches structured data", "REST/HTTP, sync")
+Rel(orchestrator, injectionDef, "7. Sanitize retrieved chunks", "in-process")
+Rel(orchestrator, generation, "8. Generate answer from sanitized context + structured data", "in-process")
+Rel(generation, llmProvider, "Sends prompt and context; receives generated answer", "HTTPS/API, sync")
+Rel(orchestrator, outputVal, "9. Validate generated answer against chunks + structured data", "in-process")
+Rel(orchestrator, postgres, "10. Persist validated chat history / session state", "SQL, sync")
+Rel(orchestrator, redis, "10. Cache the validated response", "sync")
+
+Rel(ingestion, chroma, "Writes chunks and embeddings — offline, before serving traffic", "in-process")
+Rel(ingestion, llmProvider, "Computes embeddings for corpus documents — offline", "HTTPS/API, sync")
+
+UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")

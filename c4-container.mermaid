@@ -1,0 +1,23 @@
+C4Container
+title Container diagram — RAGuard (MVP)
+
+Person(customer, "OmniBank Customer", "A retail or corporate bank customer with a question about products, policies, or fees.")
+
+System_Boundary(raguard, "RAGuard") {
+  Container(nginx, "Nginx", "Docker container", "Reverse proxy: TLS termination, IP allowlist / Basic Auth. Routes external traffic to the application.")
+  Container(app, "RAGuard App", "FastAPI / Python, Docker container", "REST API, RAG engine (retrieval + generation), and the full guardrail layer (PII redaction, prompt-injection defense, output validation, rate limiting) as in-process logic, plus an offline ingestion script for the document corpus. Embeds ChromaDB directly — not a separate container.")
+  Container(legacyMock, "Legacy Mock Service", "FastAPI / Python, Docker container", "Simulates the OmniBank Legacy Core: exposes REST endpoints for structured product, rate, and policy data.")
+  ContainerDb(postgres, "PostgreSQL", "Docker container", "Session state (simplified) and chat history. Not structured product/rate data — that stays behind the legacy abstraction layer.")
+  ContainerDb(redis, "Redis", "Docker container", "Rate-limit counters; cache for frequent, fully-validated responses (ephemeral), keyed by redacted query. Not the vector store.")
+}
+
+System_Ext(llmProvider, "LLM / Embeddings Provider", "External API (e.g. Cohere) used for embeddings and chat completions.")
+
+Rel(customer, nginx, "Asks questions", "HTTPS")
+Rel(nginx, app, "Routes requests", "HTTP, internal Docker network")
+Rel(app, legacyMock, "Reads structured product and rate data", "REST/HTTP, sync")
+Rel(app, postgres, "Reads/writes session state and chat history", "SQL, sync")
+Rel(app, redis, "Reads/writes cached responses, query embeddings, and rate-limit counters", "Redis protocol, sync")
+Rel(app, llmProvider, "Sends redacted queries and retrieved context; receives embeddings and generated answers", "HTTPS/API, sync")
+
+UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
