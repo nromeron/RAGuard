@@ -216,8 +216,10 @@ standard's requirements, and where the honest answer is "not implemented."
 ### 3.4 Reliability & business-risk challenges
 
 **9. Single point of failure: dependency on third-party APIs**
-Both the LLM and the embeddings provider are external services outside this project's control (risk
-register row 11). If either becomes unavailable, the system's behavior needs to be a deliberate
+Both the LLM and the embeddings provider are external services outside this project's control — and,
+by design (ADR 0002, ADR 0005), the same vendor: Cohere. That's a deliberate simplicity trade-off, not
+an oversight, but it means a single outage takes down retrieval and generation together, not
+independently (risk register row 11). The system's behavior on that outage needs to be a deliberate
 choice, not an accident: this project fails hard and honestly — returning a clear "service temporarily
 unavailable" response — rather than attempting a degraded answer assembled without generation. In a
 banking context, an honest failure is safer than a response that looks complete but wasn't properly
@@ -336,7 +338,11 @@ deferred.
 
 #### Risk 11 — Third-party API unavailable — single point of failure
 - **Category:** Technical
-- **Probability:** Medium — external SaaS outages happen periodically
+- **Probability:** Medium — external SaaS outages happen periodically. Both the LLM and embeddings
+  calls go through the same provider, Cohere (ADR 0002, ADR 0005) — a deliberate simplicity choice,
+  not an oversight, but one that means a single Cohere outage takes down retrieval and generation at
+  the same time, not independently. The effective probability of total pipeline failure is higher than
+  treating them as two separate dependencies would suggest.
 - **Impact:** High — the entire response pipeline depends on this call; no fallback provider is configured
 - **Mitigation:** Detect provider failure (timeout/error) and return an explicit, honest "service temporarily unavailable" response, rather than attempting a degraded answer assembled without generation.
 - **Decision:** **Implement** hard-fail behavior with a clear error response; **defer** multi-provider fallback / automatic failover. *Why:* in a banking context, an honest failure is safer than a partial or ungrounded response that looks complete but wasn't properly generated — the user knows to retry or use another channel, rather than receiving something that looks like an answer but isn't.
